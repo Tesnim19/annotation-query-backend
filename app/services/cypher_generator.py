@@ -56,13 +56,87 @@ class CypherQueryGenerator(QueryGeneratorInterface):
 
         logger.info(f"Finished loading {len(nodes_paths)} nodes and {len(edges_paths)} edges datasets.")
 
-    def run_query(self, query_code):
+    def run_query(self, query_code, limit):
         if isinstance(query_code, list):
             query_code = query_code[0]
+        try:
+            curr_limit = min(5000, int(limit))  # TODO: Find a better way for the max limit
+        except (ValueError, TypeError):
+            curr_limit = 5000
+
         with self.driver.session() as session:
-            results = session.run(query_code)
-            result_list = [record for record in results]
-            return result_list
+            # Split query into match and return parts
+            match_part = query_code.split('RETURN')[0]
+            return_part = query_code.split('RETURN')[1].split('LIMIT')[0] if 'LIMIT' in query_code else query_code.split('RETURN')[1]
+            
+            # Get all variables from return clause and clean them
+            return_vars = [v.strip() for v in return_part.split(',') if v.strip()]
+            
+            # Separate node and relationship variables
+            node_vars = [v for v in return_vars if v.startswith('n')]
+            rel_vars = [v for v in return_vars if v.startswith('r')]
+
+            # Build the counting expression for all nodes and relationships
+            node_counts = []
+            for var in node_vars:
+                node_counts.append(f"collect(DISTINCT {var})")
+            
+            rel_counts = []
+            for var in rel_vars:
+                rel_counts.append(f"collect(DISTINCT {var})")
+
+            # Combine all node collections and all relationship collections
+            node_count_expr = "size(reduce(s = [], l IN [" + ", ".join(node_counts) + "] | s + l))" if node_counts else "0"
+            rel_count_expr = "size(reduce(s = [], l IN [" + ", ".join(rel_counts) + "] | s + l))" if rel_counts else "0"
+
+            # Create the collection expression without quotes around variable names
+            result_map = ", ".join(f"{v}: {v}" for v in return_vars)
+
+            modified_query = f"""
+            {match_part}
+            WITH {', '.join(return_vars)}
+            WITH 
+                {node_count_expr} as total_nodes,
+                {rel_count_expr} as total_edges,
+                collect({{{result_map}}}) as all_results
+            RETURN 
+                total_nodes,
+                total_edges,
+                all_results[..{curr_limit}] as limited_results
+            """
+
+            # Execute the modified query
+            try:
+                result = session.run(modified_query).single()
+                
+                if result:
+                    # Process the results
+                    limited_results = []
+                    for item in result['limited_results']:
+                        record = {}
+                        for key, value in item.items():
+                            record[key] = value
+                        limited_results.append(record)
+
+                    return {
+                        'results': limited_results,
+                        'counts': {
+                            'total_nodes': result['total_nodes'],
+                            'total_edges': result['total_edges']
+                        }
+                    }
+                else:
+                    return {
+                        'results': [],
+                        'counts': {
+                            'total_nodes': 0,
+                            'total_edges': 0
+                        }
+                    }
+            except Exception as e:
+                logger.error(f"Query execution error: {e}")
+                logger.error(f"Generated query: {modified_query}")
+                raise
 
     def query_Generator(self, requests, node_map):
         nodes = requests['nodes']
@@ -77,8 +151,10 @@ class CypherQueryGenerator(QueryGeneratorInterface):
 
         match_preds = []
         return_preds = []
+        where_preds = []
         match_no_preds = []
         return_no_preds = []
+        where_no_preds = []
         node_ids = set()
         # Track nodes that are included in relationships
         used_nodes = set()
@@ -87,8 +163,10 @@ class CypherQueryGenerator(QueryGeneratorInterface):
             for node in nodes:
                 var_name = f"n_{node['node_id']}"
                 match_no_preds.append(self.match_node(node, var_name))
+                if node['properties']:
+                    where_no_preds.extend(self.where_construct(node, var_name))
                 return_no_preds.append(var_name)
-            cypher_query = self.construct_clause(match_no_preds, return_no_preds)
+            cypher_query = self.construct_clause(match_no_preds, return_no_preds, where_no_preds)
             cypher_queries.append(cypher_query)
         else:
             for i, predicate in enumerate(predicates):
@@ -99,8 +177,10 @@ class CypherQueryGenerator(QueryGeneratorInterface):
                 target_var = target_node['node_id']
 
                 source_match = self.match_node(source_node, source_var)
+                where_preds.extend(self.where_construct(source_node, source_var))
                 match_preds.append(source_match)
                 target_match = self.match_node(target_node, target_var)
+                where_preds.extend(self.where_construct(target_node, target_var))
 
                 match_preds.append(f"({source_var})-[r{i}:{predicate_type}]->{target_match}")
                 return_preds.append(f"r{i}")
@@ -114,49 +194,69 @@ class CypherQueryGenerator(QueryGeneratorInterface):
                 if node_id not in used_nodes:
                     var_name = f"n_{node_id}"
                     match_no_preds.append(self.match_node(node, var_name))
+                    where_no_preds.extend(self.where_construct(node, var_name))
                     return_no_preds.append(var_name)
 
-            return_preds.extend(list(node_ids))
+            list_of_node_ids = list(node_ids)
+            list_of_node_ids.sort()
+            return_preds.extend(list(list_of_node_ids))
                 
             if (len(match_no_preds) == 0):
-                cypher_query = self.construct_clause(match_preds, return_preds)
+                cypher_query = self.construct_clause(match_preds, return_preds, where_preds)
                 cypher_queries.append(cypher_query)
             else:
-                cypher_query = self.construct_union_clause(match_preds, return_preds, match_no_preds, return_no_preds)
+                cypher_query = self.construct_union_clause(match_preds, return_preds, where_preds, match_no_preds, return_no_preds, where_no_preds)
                 cypher_queries.append(cypher_query)
         return cypher_queries
     
-    def construct_clause(self, match_clause, return_clause):
+    def construct_clause(self, match_clause, return_clause, where_no_preds):
         match_clause = f"MATCH {', '.join(match_clause)}"
         return_clause = f"RETURN {', '.join(return_clause)}"
-        query = f"{match_clause} {return_clause}"
-        return query
+        if len(where_no_preds) > 0:
+            where_clause = f"WHERE {' AND '.join(where_no_preds)}"
+            return f"{match_clause} {where_clause} {return_clause}"
+        return f"{match_clause} {return_clause}"
 
-    def construct_union_clause(self, match_preds, return_preds, match_no_preds, return_no_preds):
+    def construct_union_clause(self, match_preds, return_preds, where_preds ,match_no_preds, return_no_preds, where_no_preds):
+        where_clause = ""
+        where_no_clause = ""
         match_preds = f"MATCH {', '.join(match_preds)}"
         tmp_return_preds = return_preds
         return_preds = f"RETURN {', '.join(return_preds)} , null AS {', null AS '.join(return_no_preds)}"
+        if len(where_preds) > 0:
+            where_clause = f"WHERE {' AND '.join(where_preds)}"
         match_no_preds = f"MATCH {', '.join(match_no_preds)}"
         return_no_preds = f"RETURN  {', '.join(return_no_preds)} , null AS {', null AS '.join(tmp_return_preds)}"
-        query = f"{match_preds} {return_preds} UNION {match_no_preds} {return_no_preds}"
+        if len(where_no_preds) > 0:
+            where_no_clause = f"WHERE {' AND '.join(where_no_preds)}"
+        query = f"{match_preds} {where_clause} {return_preds} UNION {match_no_preds} {where_no_clause} {return_no_preds}"
         return query
 
     def match_node(self, node, var_name):
         if node['id']:
             return f"({var_name}:{node['type']} {{id: '{node['id']}'}})"
-        elif node['properties']:
-            properties = ", ".join([f"{k}: '{v}'" for k, v in node['properties'].items()])
-            return f"({var_name}:{node['type']} {{{properties}}})"
         else:
             return f"({var_name}:{node['type']})"
+
+    def where_construct(self, node, var_name):
+        properties = []
+        if node['id']: 
+            return properties
+        for key, property in node['properties'].items():
+            properties.append(f"{var_name}.{key} =~ '(?i){property}'")
+        return properties
 
     def parse_neo4j_results(self, results, all_properties):
         (nodes, edges, _, _) = self.process_result(results, all_properties)
         return {"nodes": nodes, "edges": edges}
 
     def parse_and_serialize(self, input, schema, all_properties):
-        parsed_result = self.parse_neo4j_results(input, all_properties)
-        return parsed_result["nodes"], parsed_result["edges"]
+        parsed_result = self.parse_neo4j_results(input['results'], all_properties)
+        return (
+            parsed_result["nodes"],  # nodes
+            parsed_result["edges"],  # edges
+            input['counts']  # count information
+        )
 
     def convert_to_dict(self, results, schema):
         (_, _, node_dict, edge_dict) = self.process_result(results, True)
@@ -170,8 +270,9 @@ class CypherQueryGenerator(QueryGeneratorInterface):
         edge_to_dict = {}
         node_type = set()
         edge_type = set()
+        visited_relations = set()
 
-        named_types = ['gene_name', 'transcript_name', 'protein_name']
+        named_types = ['gene_name', 'transcript_name', 'protein_name', 'pathway_name', 'term_name']
 
         for record in results:
             for item in record.values():
@@ -192,6 +293,8 @@ class CypherQueryGenerator(QueryGeneratorInterface):
                             else:
                                 if key in named_types:
                                     node_data["data"]["name"] = value
+                        if "name" not in node_data["data"]:
+                            node_data["data"]["name"] = node_id
                         nodes.append(node_data)
                         if node_data["data"]["type"] not in node_type:
                             node_type.add(node_data["data"]["type"])
@@ -209,6 +312,10 @@ class CypherQueryGenerator(QueryGeneratorInterface):
                             "target": target_id,
                         }
                     }
+                    temp_relation_id = f"{source_id} - {item.type} - {target_id}"
+                    if temp_relation_id in visited_relations:
+                        continue
+                    visited_relations.add(temp_relation_id)
 
                     for key, value in item.items():
                         if key == 'source':

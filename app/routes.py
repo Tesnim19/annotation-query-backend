@@ -12,6 +12,7 @@ from app.lib.auth import token_required
 from app.lib.email import init_mail, send_email
 from dotenv import load_dotenv
 from distutils.util import strtobool
+from app.lib.request_enchance import RequestIntermediator
 
 # Load environmental variables
 load_dotenv()
@@ -80,29 +81,57 @@ def get_relations_for_node_endpoint(current_user_id, node_label):
     return Response(relations, mimetype='application/json')
 
 @app.route('/query', methods=['POST'])
-@token_required
-def process_query(current_user_id):
+# @token_required
+def process_query():
+
+    limit = 5000;
     data = request.get_json()
     if not data or 'requests' not in data:
         return jsonify({"error": "Missing requests data"}), 400
     
-    limit = request.args.get('limit')
-    properties = request.args.get('properties')
-    
-    if properties:
-        properties = bool(strtobool(properties))
-    else:
-        properties = False
-
-    if limit:
-        try:
-            limit = int(limit)
-        except ValueError:
-            return jsonify({"error": "Invalid limit value. It should be an integer."}), 400
-    else:
-        limit = None
     try:
         requests = data['requests']
+
+         # Check if any predicates have empty/unspecified types
+        has_unspecified = any(
+            not p.get('type') 
+            for p in requests.get('predicates', [])
+        )
+
+        # If there are unspecified relationships, check for possible paths
+        if has_unspecified:
+            intermediator = RequestIntermediator()
+            enhanced_requests = intermediator.enhance_request(requests)
+
+            if len(enhanced_requests) > 1:
+                formatted_requests = {
+                    f"request_{i+1}": req 
+                    for i, req in enumerate(enhanced_requests)
+                }
+                return jsonify({
+                    "status": "needs_enhancement",
+                    "possible_paths": formatted_requests
+                }), 200
+
+            # If only one enhancement possible, use that request
+            requests = enhanced_requests[0]
+        
+
+        limit = request.args.get('limit')
+        properties = request.args.get('properties')
+        
+        if properties:
+            properties = bool(strtobool(properties))
+        else:
+            properties = False
+
+        if limit:
+            try:
+                limit = int(limit)
+            except ValueError:
+                return jsonify({"error": "Invalid limit value. It should be an integer."}), 400
+        else:
+            limit = None
         
         # Validate the request data before processing
         node_map = validate_request(requests, schema_manager.schema)
@@ -119,12 +148,22 @@ def process_query(current_user_id):
         query_code = db_instance.query_Generator(requests, node_map)
         
         # Run the query and parse the results
-        result = db_instance.run_query(query_code)
-        parsed_result = db_instance.parse_and_serialize(result, schema_manager.schema, properties)
+        result = db_instance.run_query(query_code, limit)
+        nodes, edges, counts = db_instance.parse_and_serialize(
+            result, 
+            schema_manager.schema, 
+            properties
+        )
         
         response_data = {
-            "nodes": parsed_result[0],
-            "edges": parsed_result[1]
+            "nodes": nodes,
+            "edges": edges,
+            "metadata": {
+                "total_nodes": counts['total_nodes'],
+                "total_edges": counts['total_edges'],
+                "limited": len(nodes) >= int(limit) if limit else False,
+                "limit": int(limit) if limit else None
+            }
         }
 
         title = llm.generate_title(query_code)
@@ -133,7 +172,7 @@ def process_query(current_user_id):
         if isinstance(query_code, list):
             query_code = query_code[0]
 
-        storage_service.save(str(current_user_id), query_code, title, summary)
+        # storage_service.save(str(current_user_id), query_code, title, summary)
 
         if limit:
             response_data = limit_graph(response_data, limit)
