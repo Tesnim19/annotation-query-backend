@@ -118,8 +118,11 @@ def process_query():
         
 
         limit = request.args.get('limit')
+        take = request.args.get('take', default=10)
+        page = request.args.get('page', default=1)
+
         properties = request.args.get('properties')
-        
+            
         if properties:
             properties = bool(strtobool(properties))
         else:
@@ -145,8 +148,8 @@ def process_query():
         requests = db_instance.parse_id(requests)
 
         # Generate the query code
-        query_code = db_instance.query_Generator(requests, node_map)
-        
+        query_code = db_instance.query_Generator(requests, node_map,take, page)
+
         # Run the query and parse the results
         result = db_instance.run_query(query_code, limit)
         nodes, edges, counts = db_instance.parse_and_serialize(
