@@ -83,8 +83,6 @@ def get_relations_for_node_endpoint(current_user_id, node_label):
 @app.route('/query', methods=['POST'])
 # @token_required
 def process_query():
-
-    limit = 5000;
     data = request.get_json()
     if not data or 'requests' not in data:
         return jsonify({"error": "Missing requests data"}), 400
@@ -92,7 +90,7 @@ def process_query():
     try:
         requests = data['requests']
 
-         # Check if any predicates have empty/unspecified types
+        # Check if any predicates have empty/unspecified types
         has_unspecified = any(
             not p.get('type') 
             for p in requests.get('predicates', [])
@@ -115,27 +113,20 @@ def process_query():
 
             # If only one enhancement possible, use that request
             requests = enhanced_requests[0]
-        
 
-        limit = request.args.get('limit')
         take = request.args.get('take', default=10)
         page = request.args.get('page', default=1)
-
-        properties = request.args.get('properties')
+        limit = request.args.get('limit')
+        properties = request.args.get('properties', default='false')
             
-        if properties:
-            properties = bool(strtobool(properties))
-        else:
-            properties = False
+        properties = bool(strtobool(properties))
 
         if limit:
             try:
                 limit = int(limit)
             except ValueError:
                 return jsonify({"error": "Invalid limit value. It should be an integer."}), 400
-        else:
-            limit = None
-        
+
         # Validate the request data before processing
         node_map = validate_request(requests, schema_manager.schema)
         if node_map is None:
@@ -147,36 +138,32 @@ def process_query():
         #convert id to appropriate format
         requests = db_instance.parse_id(requests)
 
-        # Generate the query code
-        query_code = db_instance.query_Generator(requests, node_map,take, page)
+        # Generate the query code - now returns [count_query, data_query]
+        query_code = db_instance.query_Generator(requests, node_map, take, page)
 
         # Run the query and parse the results
-        result = db_instance.run_query(query_code, limit)
-        nodes, edges, counts = db_instance.parse_and_serialize(
-            result, 
-            schema_manager.schema, 
-            properties
-        )
+        result = db_instance.run_query(query_code)
+        
+        # Get the counts from the last item in results
+        counts = next((item for item in result if "totalNodes" in item and "totalEdges" in item), None)
+        # Remove counts from results
+        result = [item for item in result if "totalNodes" not in item and "totalEdges" not in item]
+        
+        parsed_result = db_instance.parse_and_serialize(result, schema_manager.schema, properties)
         
         response_data = {
-            "nodes": nodes,
-            "edges": edges,
+            "nodes": parsed_result[0],
+            "edges": parsed_result[1],
             "metadata": {
-                "total_nodes": counts['total_nodes'],
-                "total_edges": counts['total_edges'],
-                "limited": len(nodes) >= int(limit) if limit else False,
-                "limit": int(limit) if limit else None
+                "total_nodes": counts["totalNodes"] if counts else None,
+                "total_edges": counts["totalEdges"] if counts else None,
+                "page": int(page),
+                "items_per_page": int(take),
+                "limited": bool(limit),
+                "limit": limit
             }
         }
-
-        title = llm.generate_title(query_code)
-        summary = llm.generate_summary(response_data)
-
-        if isinstance(query_code, list):
-            query_code = query_code[0]
-
-        # storage_service.save(str(current_user_id), query_code, title, summary)
-
+        
         if limit:
             response_data = limit_graph(response_data, limit)
 
@@ -259,23 +246,18 @@ def process_user_history_by_id(current_user_id, id):
         return jsonify('No value Found'), 200
     
     query = cursor.query
-
+    take = request.args.get('take', default=10)
+    page = request.args.get('page', default=1)
     limit = request.args.get('limit')
-    properties = request.args.get('properties')
+    properties = request.args.get('properties', default='false')
     
-    if properties:
-        properties = bool(strtobool(properties))
-    else:
-        properties = False
+    properties = bool(strtobool(properties))
 
     if limit:
         try:
             limit = int(limit)
         except ValueError:
             return jsonify({"error": "Invalid limit value. It should be an integer."}), 400
-    else:
-        limit = None
-
 
     try:
         database_type = config['database']['type']
@@ -283,11 +265,25 @@ def process_user_history_by_id(current_user_id, id):
         
         # Run the query and parse the results
         result = db_instance.run_query(query)
+        
+        # Get the counts from the last item in results
+        counts = next((item for item in result if "totalNodes" in item and "totalEdges" in item), None)
+        # Remove counts from results
+        result = [item for item in result if "totalNodes" not in item and "totalEdges" not in item]
+        
         parsed_result = db_instance.parse_and_serialize(result, schema_manager.schema, properties)
         
         response_data = {
             "nodes": parsed_result[0],
-            "edges": parsed_result[1]
+            "edges": parsed_result[1],
+            "metadata": {
+                "total_nodes": counts["totalNodes"] if counts else None,
+                "total_edges": counts["totalEdges"] if counts else None,
+                "page": int(page),
+                "items_per_page": int(take),
+                "limited": bool(limit),
+                "limit": limit
+            }
         }
 
         if limit:
